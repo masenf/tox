@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import fnmatch
+import io
 import logging
 import os
 import shutil
@@ -240,12 +241,19 @@ class LocalSubProcessExecuteInstance(ExecuteInstance):
 
     @staticmethod
     def get_stream_file_no(key: str) -> Generator[int, Popen[bytes], None]:
-        process = yield PIPE
-        stream = getattr(process, key)
-        if sys.platform == "win32":  # explicit check for mypy # pragma: win32 cover
-            yield stream.handle
+        pty = _pty(key)
+        if pty is not None:
+            child_fd, main_fd = pty
+            yield child_fd
+            os.close(child_fd)  # close the child process pipe
+            yield main_fd
         else:
-            yield stream.name
+            process = yield PIPE
+            stream = getattr(process, key)
+            if sys.platform == "win32":  # explicit check for mypy # pragma: win32 cover
+                yield stream.handle
+            else:
+                yield stream.name
 
     def set_out_err(self, out: SyncWrite, err: SyncWrite) -> tuple[SyncWrite, SyncWrite]:
         prev = self._out, self._err
@@ -254,6 +262,43 @@ class LocalSubProcessExecuteInstance(ExecuteInstance):
         if self._read_stderr is not None:  # pragma: no branch
             self._read_stderr.handler = err.handler
         return prev
+
+
+def _pty(key: str) -> tuple[int, int] | None:
+    """Open a virtual terminal for a subprocess."""
+    stream: io.TextIOWrapper = getattr(sys, key)
+
+    # when our current stream is a tty, emulate pty for the child
+    #   to allow host streams traits to be inherited
+    if not stream.isatty():
+        return None
+
+    try:
+        import fcntl
+        import pty
+        import struct
+        import termios
+    except ImportError:  # pragma: no cover
+        return None  # cannot proceed on platforms without pty support
+
+    try:
+        main, child = pty.openpty()
+    except OSError:  # could not open a tty
+        return None  # pragma: no cover
+
+    try:
+        mode = termios.tcgetattr(stream)
+        termios.tcsetattr(child, termios.TCSANOW, mode)
+    except (termios.error, OSError):  # could not inherit traits
+        return None  # pragma: no cover
+
+    # adjust sub-process terminal size
+    columns, lines = shutil.get_terminal_size(fallback=(-1, -1))
+    if columns != -1 and lines != -1:
+        size = struct.pack("HHHH", columns, lines, 0, 0)
+        fcntl.ioctl(child, termios.TIOCSWINSZ, size)
+
+    return child, main
 
 
 __all__ = (
